@@ -1,0 +1,3 @@
+[submodule "declare"]
+	path = declare
+	url = https://github.com/VaitoSoi/claritas.git

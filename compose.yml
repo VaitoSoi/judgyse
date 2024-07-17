@@ -1,0 +1,9 @@
+services:
+  judgyse:
+    image: judgyse:latest
+    ports:
+      - 8080-8081:8000
+    volumes:
+      - type: bind
+        source: //var/run/docker.sock
+        target: //var/run/docker.sock
