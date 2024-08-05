@@ -44,7 +44,10 @@ if RUN_IN_DOCKER:
         else:
             raise error
 
-if INSIDE_DOCKER:
+JUDGE_DIR = os.getenv("JUDGE_DIR", None)
+if JUDGE_DIR:
+    judge_dir = JUDGE_DIR
+elif INSIDE_DOCKER:
     HOSTNAME = os.getenv("HOSTNAME", None)
     process_id = DockerClient.api.inspect_container(HOSTNAME)["Name"].split("_")[-1]
     judge_dir = os.path.join(os.path.abspath("judge"), process_id[1:])
@@ -58,10 +61,11 @@ HARD_LIMIT = os.getenv("HARD_LIMIT", None) == "1"
 COMPILER_MEM_LIMIT = os.getenv("COMPILER_MEM_LIMIT", "1024m")
 TIME_PATH = os.getenv("TIME_PATH", "/usr/bin/time")
 TIMEOUT_PATH = os.getenv("TIMEOUT_PATH", "/usr/bin/timeout")
-if HARD_LIMIT and not os.path.exists(TIME_PATH):
-    raise Exception(f"{TIME_PATH} not found")
-if HARD_LIMIT and not os.path.exists(TIMEOUT_PATH):
-    raise Exception(f"{TIMEOUT_PATH} not found")
+if HARD_LIMIT:
+    if not os.path.exists(TIME_PATH):
+        raise Exception(f"{TIME_PATH} not found")
+    if not os.path.exists(TIMEOUT_PATH):
+        raise Exception(f"{TIMEOUT_PATH} not found")
 
 stt = utils.str_to_timestamp
 mem_parse = utils.mem_convert
