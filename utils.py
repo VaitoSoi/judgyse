@@ -5,7 +5,19 @@ import shutil
 import pydantic
 from datetime import datetime
 
-__all__ = ["read", "write", "read_json", "write_json"]
+__all__ = [
+    "read", 
+    "write", 
+    "read_json", 
+    "write_json",
+    "remove_content",
+    "str_to_timestamp",
+    "get_fields",
+    "padding",
+    "mem_convert",
+    "wrap_dict",
+    "Event",
+]
 
 json_indent = os.getenv("ENV", "development") == "development" and 4 or None
 
@@ -42,7 +54,10 @@ def remove_content(folder: str, exclude: typing.List[str] = []) -> None:
 
 
 def str_to_timestamp(s: str) -> float:
-    return datetime.strptime(s[:26], "%Y-%m-%dT%H:%M:%S.%f").timestamp()
+    s = s[:26]
+    if s.endswith("Z"):
+        s = s[:-1]
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f").timestamp()
 
 
 def get_fields(
@@ -57,3 +72,38 @@ def get_fields(
             optional.append(name)
 
     return strict, optional
+
+
+def padding(arr: tuple | list, length: int, fill: typing.Any = None):
+    return arr + ([fill] if isinstance(arr, list) else (fill,)) * (length - len(arr))
+
+
+def mem_convert(mem: str) -> int:
+    mem = mem.upper()
+    if mem.endswith("K"):
+        return int(mem[:-1]) * 1024
+    if mem.endswith("M"):
+        return int(mem[:-1]) * 1024 ** 2
+    if mem.endswith("G"):
+        return int(mem[:-1]) * 1024 ** 3
+    raise ValueError(f"Unknown memory unit: {mem}")
+
+
+def wrap_dict(key_val: list[tuple[str, str]]) -> dict[str, str]:
+    return {key: val for key, val in key_val}
+
+
+class Event:
+    _flag: bool = False
+
+    def __init__(self, flag: bool = False):
+        self._flag = flag
+    
+    def set(self):
+        self._flag = True
+
+    def clear(self):
+        self._flag = False
+
+    def is_set(self):
+        return self._flag

@@ -1,33 +1,119 @@
+import multiprocessing.connection
+import os
+import shutil
+import subprocess
+import typing
+import docker
+import docker.errors
 import docker.models
 import docker.models.containers
-from declare import JudgeMode, Limit, JudgeResult, Status, Compiler, File
-import pydantic
-import typing
-import os
-import docker
-import fastapi
-import utils
-import docker.errors
 import requests
 import urllib3
-import threading
-import queue
+import utils
+import declare
+import sys
+import multiprocessing
+from exception import (
+    ABORTED,
+    MEMORYLIMIT_EXCEEDED,
+    TIMELIMIT_EXCEEDED,
+    COMPILE_ERROR,
+    SYSTEM_ERROR,
+    RUNTIME_ERROR,
+    UNKNOWN_ERROR,
+)
 
 __all__ = ["judge_dir", "execution_dir", "testcases_dir", "DockerClient"]
 
-judge_dir = os.path.abspath("judge")
+
+INSIDE_DOCKER = os.getenv("INSIDE_DOCKER", None) == "1"
+RUN_IN_DOCKER = INSIDE_DOCKER or os.getenv("RUN_IN_DOCKER", None) == "1"
+if sys.platform == "nt" and not RUN_IN_DOCKER:
+    raise Exception("Windows is not supported, use Docker instead")
+
+process_id: str = None
+judge_dir: str = None
+
+DockerClient: docker.DockerClient = None
+if RUN_IN_DOCKER:
+    try:
+        DockerClient = docker.from_env()
+    except docker.errors.DockerException as error:
+        if error.__str__().startswith("Error while fetching server API version"):
+            raise Exception("Cannot connect to Docker daemon, is it running ?")
+        else:
+            raise error
+
+if INSIDE_DOCKER:
+    HOSTNAME = os.getenv("HOSTNAME", None)
+    process_id = DockerClient.api.inspect_container(HOSTNAME)["Name"].split("_")[-1]
+    judge_dir = os.path.join(os.path.abspath("judge"), process_id[1:])
+else:
+    judge_dir = os.path.abspath("judge")
+
 execution_dir = os.path.join(judge_dir, "execution")
 testcases_dir = os.path.join(judge_dir, "testcases")
-COMPILER_MEM_LIMIT = os.getenv("COMPILER_MEM_LIMIT", "1024m")
-DockerClient = None
 
-try:
-    DockerClient = docker.from_env()
-except docker.errors.DockerException as error:
-    if error.__str__().startswith("Error while fetching server API version"):
-        raise Exception("Cannot connect to Docker daemon, is it running?")
-    else:
-        raise error
+HARD_LIMIT = os.getenv("HARD_LIMIT", None) == "1"
+COMPILER_MEM_LIMIT = os.getenv("COMPILER_MEM_LIMIT", "1024m")
+TIME_PATH = os.getenv("TIME_PATH", "/usr/bin/time")
+TIMEOUT_PATH = os.getenv("TIMEOUT_PATH", "/usr/bin/timeout")
+if HARD_LIMIT and not os.path.exists(TIME_PATH):
+    raise Exception(f"{TIME_PATH} not found")
+if HARD_LIMIT and not os.path.exists(TIMEOUT_PATH):
+    raise Exception(f"{TIMEOUT_PATH} not found")
+
+stt = utils.str_to_timestamp
+mem_parse = utils.mem_convert
+wrap = utils.wrap_dict
+
+shutil.rmtree(judge_dir, ignore_errors=True)
+os.makedirs(testcases_dir, exist_ok=True)
+os.makedirs(judge_dir, exist_ok=True)
+os.makedirs(execution_dir, exist_ok=True)
+
+
+def process_judge(
+    submission_id: str,
+    language: typing.Tuple[str, typing.Optional[int]],
+    compiler: typing.Tuple[str, typing.Union[typing.Literal["latest"], str]],
+    test_range: typing.Tuple[int, int],
+    test_file: typing.Tuple[str, str],
+    test_type: typing.Literal["file", "std"],
+    judge_mode: declare.JudgeMode,
+    limit: declare.Limit,
+    abort: multiprocessing.Event,
+    connection: multiprocessing.connection.Connection,
+):
+    try:
+        for data in judge(
+            submission_id,
+            language,
+            compiler,
+            test_range,
+            test_file,
+            test_type,
+            judge_mode,
+            limit,
+            abort,
+        ):
+            connection.send(data)
+
+    except ABORTED:
+        connection.send(("aborted", None, None))
+
+    except COMPILE_ERROR as error:
+        connection.send(("error", declare.Status.COMPILE_ERROR.value, str(error)))
+
+    except SYSTEM_ERROR as error:
+        connection.send(("error", declare.Status.SYSTEM_ERROR.value, str(error)))
+
+    except UNKNOWN_ERROR as error:
+        connection.send(("error", declare.Status.UNKNOWN_ERROR.value, str(error)))
+
+    finally:
+        connection.send(("close", None, None))
+        connection.close()
 
 
 def judge(
@@ -37,163 +123,218 @@ def judge(
     test_range: typing.Tuple[int, int],
     test_file: typing.Tuple[str, str],
     test_type: typing.Literal["file", "std"],
-    jugde_mode: JudgeMode,
-    limit: Limit,
-    ws: fastapi.WebSocket,
-    abort: threading.Event,
-    msg: queue.Queue
-):
-    def send_json(content: typing.Any):
-        content = (
-            content.model_dump() if isinstance(content, pydantic.BaseModel) else content
-        )
-        print(content)
-        msg.put(["result", content])
-
-    file = File[language[0]]
+    judge_mode: declare.JudgeMode,
+    limit: declare.Limit,
+    abort: utils.Event,
+) -> typing.Iterator[
+    tuple[typing.Literal["compile", "overall"] | int, str, dict[str, str | int] | None]
+]:  # [position, status, data]
+    file = declare.Language[language[0]]
     code = file.file.format(id=submission_id)
     executable = file.executable.format(id=submission_id)
 
-    command = Compiler[compiler[0]]
+    command = declare.Compiler[compiler[0]]
     image = command.image.format(version=compiler[1])
     compile = command.compile.format(
         source=code, executable=executable, version=language[1]
     )
     execute = command.execute.format(executable=executable)
-    print(image, compile, execute)
 
     """
     Compile
     """
+
     try:
-        warn = DockerClient.containers.run(
-            image=image,
-            command=compile,
-            detach=False,
-            stdout=True,
-            stderr=True,
-            volumes=[f"{execution_dir}:/compile"],
-            working_dir="/compile",
-            mem_limit=COMPILER_MEM_LIMIT,
-        )
-        if warn:
-            send_json(
-                JudgeResult(id=-1, status=Status.COMPILE_WARN.value, warn=warn)
+        warn: str = None
+        if not RUN_IN_DOCKER or INSIDE_DOCKER:
+            command = (
+                f"ulimit -v {mem_parse(COMPILER_MEM_LIMIT)} && {compile}"
+                if HARD_LIMIT
+                else compile
             )
-    except docker.errors.ContainerError as e:
-        return send_json(
-            JudgeResult(id=-1, status=Status.COMPILE_ERROR.value, error=str(e))
-        )
+
+            callback = subprocess.run(
+                command.split(),
+                cwd=execution_dir,
+                capture_output=True,
+                check=True,
+            )
+            warn = callback.stdout.decode()
+
+        else:
+            warn = DockerClient.containers.run(
+                image=image,
+                command=compile,
+                detach=False,
+                stdout=True,
+                stderr=True,
+                volumes=[f"{execution_dir}:/compile"],
+                working_dir="/compile",
+                mem_limit=COMPILER_MEM_LIMIT,
+            )
+
+        if warn:
+            yield "compiler", declare.Status.COMPILE_WARN.value, {"warn": warn}
+    except (docker.errors.ContainerError, subprocess.CalledProcessError) as e:
+        raise COMPILE_ERROR(*e.args) from e
+
     except docker.errors.APIError as e:
-        return send_json(
-            JudgeResult(id=-1, status=Status.SYSTEM_ERROR.value, error=str(e))
-        )
+        raise SYSTEM_ERROR(*e.args) from e
+
     except Exception as e:
-        return send_json(
-            JudgeResult(id=-1, status=Status.SYSTEM_ERROR.value, error=str(e))
-        )
+        raise UNKNOWN_ERROR(*e.args) from e
 
     """
     Execute
     """
 
-    results: typing.List[JudgeResult] = []
+    results: typing.List[declare.JudgeResult] = []
 
-    def send_and_save(data: typing.Any) -> None:
+    def yield_and_save(data: typing.Any):
+        data = utils.padding(data, 3, {})
         results.append(data)
-        return send_json(data)
+        yield data[0], data[1], data[2]
 
     for i in range(test_range[0], test_range[1] + 1, 1):
         if abort.is_set():
-            return send_json(JudgeResult(id=-1, status=Status.ABORTED.value))
+            raise ABORTED()
 
+        time: float = -1
+        memory: int = -1
         output = ""
         expect = utils.read(os.path.join(testcases_dir, str(i), test_file[1]))
-        time = -1
+
+        command = execute
+        if test_type == "std":
+            command = f"cat {test_file[0]} | {execute}"
+
+        if HARD_LIMIT:
+            command = f'/bin/bash -c "ulimit -v {mem_parse(limit.memory)} && {{timeout}} {command}"'
+
+        _execution_dir = execution_dir
+        _testcases_dir = testcases_dir
+        if INSIDE_DOCKER:
+            JUDGYSE_DIR = os.getenv("JUDGYSE_DIR", "/judgyse")
+            _execution_dir = os.path.join(JUDGYSE_DIR, *execution_dir.split("/")[2:])
+            _testcases_dir = os.path.join(JUDGYSE_DIR, *testcases_dir.split("/")[2:])
+        
+        if RUN_IN_DOCKER:
+            command = f'/usr/bin/time --format="--judgyse_static:amemory=%K,pmemory=%M,return=%x" {command.format(timeout="")}'
+        
+        else:
+            command = f'{TIME_PATH} --format="--judgyse_static:time=%e,amemory=%K,pmemory=%M,return=%x" ' \
+                      f'{command.format(timeout=TIMEOUT_PATH)}'
 
         try:
-            container: docker.models.containers.Container = DockerClient.containers.run(
-                image=image,
-                command=(
-                    execute
-                    if test_type == "file"
-                    else f"cat {test_file[0]} | {execute}"
-                ),
-                detach=True,
-                volumes=[
-                    f"{execution_dir}:/execution",
-                    f"{testcases_dir}/{i}/{test_file[0]}:/execution/{test_file[0]}",
-                ],
-                working_dir="/execution",
-                mem_limit=limit.memory,
-                network_disabled=True,
-            )
-            container.wait(timeout=limit.time)
-            inspect = DockerClient.api.inspect_container(container.id)
-            if str(inspect["State"]["OOMKilled"]).lower() == "true":
-                send_and_save(
-                    JudgeResult(id=i, status=Status.MEMORY_LIMIT_EXCEEDED.value)
+            if RUN_IN_DOCKER:
+                container: docker.models.containers.Container = DockerClient.containers.run(
+                    image=image,
+                    command=command,
+                    detach=True,
+                    mem_limit=limit.memory,
+                    network_disabled=True,
+                    working_dir="/execution",
+                    volumes=[
+                        f"{_execution_dir}:/execution",
+                        f"{TIME_PATH}:/usr/bin/time",
+                        f"{_testcases_dir}/{i}/{test_file[0]}:/execution/{test_file[0]}",
+                    ]
                 )
-            else:
-                output = None
-                if test_type == 'file':
-                    output = utils.read(os.path.join(execution_dir, test_file[1]))
-                else:
-                    output =  container.logs().decode("utf-8")
+                container.wait(timeout=limit.time)
+                inspect = DockerClient.api.inspect_container(container.id)
 
-                time = utils.str_to_timestamp(
-                    inspect["State"]["FinishedAt"]
-                ) - utils.str_to_timestamp(inspect["State"]["StartedAt"])
+                if str(inspect["State"]["OOMKilled"]).lower() == "true":
+                    raise MEMORYLIMIT_EXCEEDED()
+
+                log = container.logs(stdout=True, stderr=True).decode("utf-8")
+                _output, statics = log.split("--judgyse_static:")
+
+                state = inspect["State"]
+                statics = wrap(
+                    [tuple(static.split("=")) for static in statics[:-1].split(",")]
+                )
+
+                time = stt(state["FinishedAt"]) - stt(state["StartedAt"])
+                memory = (int(statics["amemory"]) / 1024, int(statics["pmemory"]) / 1024)
+                return_code = int(statics["return"])
+
                 container.remove()
-        except docker.errors.ContainerError as e:
-            send_and_save(
-                JudgeResult(id=i, status=Status.COMPILE_ERROR.value, error=str(e))
-            )
+
+            else:
+                callback = subprocess.run(
+                    command.split(),
+                    cwd=_execution_dir,
+                    capture_output=True,
+                    timeout=limit.time,
+                    check=True,
+                )
+                _output = callback.stdout.decode()
+                statics = callback.stderr.decode().split('--judgyse_static:')[-1][:-2]
+
+                statics = wrap(
+                    [tuple(static.split("=")) for static in statics.split(",")]
+                )
+                time = float(statics["time"])
+                memory = (int(statics["amemory"]) / 1024, int(statics["pmemory"]) / 1024)
+                return_code = int(statics["return"])
+
+            if return_code != 0:
+                raise RUNTIME_ERROR("return code is not 0")
+
+            if test_type == "file":
+                output = utils.read(os.path.join(execution_dir, test_file[1]))
+
+            else:
+                output = _output
+
+        except MEMORYLIMIT_EXCEEDED:
+            yield from yield_and_save((i, declare.Status.MEMORY_LIMIT_EXCEEDED.value))
             continue
-        except docker.errors.APIError as e:
-            send_and_save(
-                JudgeResult(id=i, status=Status.SYSTEM_ERROR.value, error=str(e))
-            )
+
+        except TIMELIMIT_EXCEEDED:
+            yield from yield_and_save((i, declare.Status.TIME_LIMIT_EXCEEDED.value))
             continue
+
         except requests.exceptions.ConnectionError as e:
             if urllib3.exceptions.ReadTimeoutError in e.args:
-                send_and_save(
-                    JudgeResult(id=i, status=Status.TIME_LIMIT_EXCEEDED.value)
-                )
+                yield from yield_and_save((i, declare.Status.TIME_LIMIT_EXCEEDED.value, str(e)))
                 continue
+
             else:
-                send_and_save(
-                    JudgeResult(id=i, status=Status.SYSTEM_ERROR.value, error=str(e))
-                )
-                continue
-        except Exception as e:
-            # raise e
-            send_and_save(
-                JudgeResult(id=i, status=Status.SYSTEM_ERROR.value, error=str(e))
-            )
+                raise SYSTEM_ERROR(*e.args) from e
+        except subprocess.TimeoutExpired:
+            yield from yield_and_save((i, declare.Status.TIME_LIMIT_EXCEEDED.value))
             continue
 
-        comp = compare(output, expect, jugde_mode)
-        send_and_save(
-            JudgeResult(
-                id=i,
-                status=Status.ACCEPTED.value if comp else Status.WRONG_ANSWER.value,
-                time=time,
+        except (
+            docker.errors.ContainerError,
+            docker.errors.APIError,
+            subprocess.CalledProcessError,
+            RUNTIME_ERROR,
+        ) as error:
+            raise error
+            raise SYSTEM_ERROR(*error.args) from error
+
+        except Exception as e:
+            raise e
+            raise UNKNOWN_ERROR(*e.args) from e
+
+        comp = compare(output, expect, judge_mode)
+        yield from yield_and_save(
+            (
+                i,
+                declare.Status.ACCEPTED.value if comp else declare.Status.WRONG_ANSWER.value,
+                {"time": time, "memory": memory},
             )
         )
 
-    results.sort(reverse=True, key=lambda x: x.status)
+    results.sort(reverse=True, key=lambda x: x[1])
     judge_status = results[0]
 
-    return send_json(
-        JudgeResult(
-            id=-1,
-            status=judge_status.status,
-        )
-    )
+    yield "overall", judge_status[1], {}
 
 
-def compare(a: str, b: str, mode: JudgeMode) -> bool:
+def compare(a: str, b: str, mode: declare.JudgeMode) -> bool:
     if mode.mode == 0:
         if mode.trim_endl:
             a = "\n".join([a for a in a.split("\n") if a])

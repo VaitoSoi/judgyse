@@ -1,9 +1,21 @@
 services:
   judgyse:
-    image: judgyse:latest
+    build: .
     ports:
       - 8080-8081:8000
     volumes:
-      - type: bind
-        source: //var/run/docker.sock
-        target: //var/run/docker.sock
+      - //var/run/docker.sock://var/run/docker.sock
+      - //usr/local/bin/time://usr/local/bin/time
+      - ./:/judgyse
+    networks:
+      - api
+    environment:
+      INSIDE_DOCKER: "1"
+      JUDGYSE_DIR: "${PWD}"
+      TIME_PATH: /usr/local/bin/time
+    scale: 2
+
+networks:
+  api:
+    name: api
+    external: true

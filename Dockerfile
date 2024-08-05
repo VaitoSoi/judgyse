@@ -1,8 +1,8 @@
 FROM python:latest
 EXPOSE 8000
 
-WORKDIR /judgyse/
-COPY . /judgyse/
+WORKDIR /judgyse
+COPY requirements.txt /judgyse/requirements.txt
 
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
