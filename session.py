@@ -2,18 +2,21 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import typing
 import zlib
 
 import fastapi
 
-import declare
-import judge
-import utils
-import exception
-from declare import JudgeSession, Language
-
+try:
+    from . import judge, utils, exception
+    from .. import declare
+    from ..declare import JudgeSession, Language
+except ImportError:
+    import judge
+    import utils
+    import exception
+    import declare
+    from declare import JudgeSession, Language
 
 Status = typing.Literal["busy", "idle", "disconnect"]
 HEARTBEAT_INTERVAL = os.getenv("HEARTBEAT_INTERVAL", 3)
@@ -26,7 +29,7 @@ class SessionManager:
         typing.Optional[str],
     ] = ["disconnect"]
     session: JudgeSession
-    judge_abort: utils.Event = None
+    judge_abort: utils.Event = None  # noqa
     logger: logging.Logger = logging.getLogger("uvicorn.error")
     messages: asyncio.Queue = asyncio.Queue()
     stop_recv: asyncio.Event = asyncio.Event()
@@ -50,8 +53,8 @@ class SessionManager:
     async def disconnect(self, reason: tuple[int, str | None] = (1000,)) -> None:
         self.stop_recv.set()
         if (
-            self.ws is not None
-            and self.ws.client_state != fastapi.websockets.WebSocketState.DISCONNECTED
+                self.ws is not None
+                and self.ws.client_state != fastapi.websockets.WebSocketState.DISCONNECTED
         ):
             try:
                 await self.ws.close(*reason)
@@ -72,8 +75,8 @@ class SessionManager:
                 return
 
             if (
-                self.ws is None
-                or self.ws.client_state == fastapi.websockets.WebSocketState.DISCONNECTED
+                    self.ws is None
+                    or self.ws.client_state == fastapi.websockets.WebSocketState.DISCONNECTED
             ):
                 return await self.disconnect((1000, "client disconnected"))
 
@@ -131,19 +134,14 @@ class SessionManager:
 
         except Exception as error:
             raise error from error
-            await self.send(["error", str(error)])
+            # await self.send(["error", str(error)])
 
     async def handle(self, command: str, parsed: typing.Any) -> None:
         match command:
             case "start":
                 self.status = ["busy"]
-                self.session = {}
-                self.judge_thread = None
+                self.session: declare = {}
                 self.judge_abort = utils.Event()
-                shutil.rmtree(judge.judge_dir, ignore_errors=True)
-                os.makedirs(judge.testcases_dir, exist_ok=True)
-                os.makedirs(judge.judge_dir, exist_ok=True)
-                os.makedirs(judge.execution_dir, exist_ok=True)
 
             case "init":
                 await self.parse_session(parsed)
@@ -157,15 +155,15 @@ class SessionManager:
             case "judge":
                 try:
                     for position, status, data in judge.judge(
-                        self.session.submission_id,
-                        self.session.language,
-                        self.session.compiler,
-                        self.session.test_range,
-                        self.session.test_file,
-                        self.session.test_type,
-                        self.session.judge_mode,
-                        self.session.limit,
-                        self.judge_abort,
+                            self.session.submission_id,
+                            self.session.language,
+                            self.session.compiler,
+                            self.session.test_range,
+                            self.session.test_file,
+                            self.session.test_type,
+                            self.session.judge_mode,
+                            self.session.limit,
+                            self.judge_abort,
                     ):
                         if isinstance(position, int):
                             self.status = ["busy", str(position)]
@@ -187,19 +185,19 @@ class SessionManager:
                         [
                             "judge.error",
                             declare.JudgeResult(
-                                position="compiler", 
+                                position="compiler",
                                 status=declare.Status.COMPILE_ERROR,
                                 error=str(error),
                             ).model_dump(),
                         ]
                     )
-                
+
                 except exception.SYSTEM_ERROR as error:
                     await self.send(
                         [
                             "judge.error",
                             declare.JudgeResult(
-                                position="system", 
+                                position="system",
                                 status=declare.Status.SYSTEM_ERROR,
                                 error=str(error),
                             ).model_dump(),
@@ -212,7 +210,7 @@ class SessionManager:
                         [
                             "judge.error",
                             declare.JudgeResult(
-                                position="system", 
+                                position="system",
                                 status=declare.Status.SYSTEM_ERROR,
                                 error=str(error),
                             ).model_dump(),
@@ -223,8 +221,6 @@ class SessionManager:
                 self.clear()
 
             case "abort":
-                if not self.judge_thread or not self.judge_thread.is_alive():
-                    raise exception.NoActiveThread()
                 self.judge_abort.set()
 
             case "status":
@@ -255,7 +251,7 @@ class SessionManager:
 
     async def write_testcase(self, data: typing.Tuple[int, str, str, bool]) -> None:
         if data[0] not in range(
-            self.session.test_range[0], self.session.test_range[1] + 1
+                self.session.test_range[0], self.session.test_range[1] + 1
         ):
             raise exception.InvalidTestcaseIndex(data[0])
 

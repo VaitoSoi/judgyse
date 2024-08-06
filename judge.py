@@ -1,30 +1,48 @@
-import multiprocessing.connection
 import os
 import shutil
 import subprocess
+import sys
 import typing
+
 import docker
 import docker.errors
 import docker.models
 import docker.models.containers
 import requests
 import urllib3
-import utils
+
 import declare
-import sys
-import multiprocessing
-from exception import (
-    ABORTED,
-    MEMORYLIMIT_EXCEEDED,
-    TIMELIMIT_EXCEEDED,
-    COMPILE_ERROR,
-    SYSTEM_ERROR,
-    RUNTIME_ERROR,
-    UNKNOWN_ERROR,
-)
+try:
+    from . import utils
+    from .exception import (
+        ABORTED,
+        MEMORYLIMIT_EXCEEDED,
+        TIMELIMIT_EXCEEDED,
+        COMPILE_ERROR,
+        SYSTEM_ERROR,
+        RUNTIME_ERROR,
+        UNKNOWN_ERROR,
+    )
+except ImportError:
+    import declare
+    import utils
+    from exception import (
+        ABORTED,
+        MEMORYLIMIT_EXCEEDED,
+        TIMELIMIT_EXCEEDED,
+        COMPILE_ERROR,
+        SYSTEM_ERROR,
+        RUNTIME_ERROR,
+        UNKNOWN_ERROR,
+    )
 
-__all__ = ["judge_dir", "execution_dir", "testcases_dir", "DockerClient"]
-
+__all__ = [
+    "judge_dir",
+    "execution_dir",
+    "testcases_dir",
+    "DockerClient",
+    "judge"
+]
 
 INSIDE_DOCKER = os.getenv("INSIDE_DOCKER", None) == "1"
 RUN_IN_DOCKER = INSIDE_DOCKER or os.getenv("RUN_IN_DOCKER", None) == "1"
@@ -44,18 +62,12 @@ if RUN_IN_DOCKER:
         else:
             raise error
 
-JUDGE_DIR = os.getenv("JUDGE_DIR", None)
-if JUDGE_DIR:
-    judge_dir = JUDGE_DIR
-elif INSIDE_DOCKER:
+if INSIDE_DOCKER:
     HOSTNAME = os.getenv("HOSTNAME", None)
     process_id = DockerClient.api.inspect_container(HOSTNAME)["Name"].split("_")[-1]
     judge_dir = os.path.join(os.path.abspath("judge"), process_id[1:])
 else:
     judge_dir = os.path.abspath("judge")
-
-execution_dir = os.path.join(judge_dir, "execution")
-testcases_dir = os.path.join(judge_dir, "testcases")
 
 HARD_LIMIT = os.getenv("HARD_LIMIT", None) == "1"
 COMPILER_MEM_LIMIT = os.getenv("COMPILER_MEM_LIMIT", "1024m")
@@ -67,72 +79,37 @@ if HARD_LIMIT:
     if not os.path.exists(TIMEOUT_PATH):
         raise Exception(f"{TIMEOUT_PATH} not found")
 
+execution_dir = os.path.join(judge_dir, "execution")
+testcases_dir = os.path.join(judge_dir, "testcases")
+
 stt = utils.str_to_timestamp
 mem_parse = utils.mem_convert
 wrap = utils.wrap_dict
 
-shutil.rmtree(judge_dir, ignore_errors=True)
-os.makedirs(testcases_dir, exist_ok=True)
-os.makedirs(judge_dir, exist_ok=True)
-os.makedirs(execution_dir, exist_ok=True)
-
-
-def process_judge(
-    submission_id: str,
-    language: typing.Tuple[str, typing.Optional[int]],
-    compiler: typing.Tuple[str, typing.Union[typing.Literal["latest"], str]],
-    test_range: typing.Tuple[int, int],
-    test_file: typing.Tuple[str, str],
-    test_type: typing.Literal["file", "std"],
-    judge_mode: declare.JudgeMode,
-    limit: declare.Limit,
-    abort: multiprocessing.Event,
-    connection: multiprocessing.connection.Connection,
-):
-    try:
-        for data in judge(
-            submission_id,
-            language,
-            compiler,
-            test_range,
-            test_file,
-            test_type,
-            judge_mode,
-            limit,
-            abort,
-        ):
-            connection.send(data)
-
-    except ABORTED:
-        connection.send(("aborted", None, None))
-
-    except COMPILE_ERROR as error:
-        connection.send(("error", declare.Status.COMPILE_ERROR.value, str(error)))
-
-    except SYSTEM_ERROR as error:
-        connection.send(("error", declare.Status.SYSTEM_ERROR.value, str(error)))
-
-    except UNKNOWN_ERROR as error:
-        connection.send(("error", declare.Status.UNKNOWN_ERROR.value, str(error)))
-
-    finally:
-        connection.send(("close", None, None))
-        connection.close()
-
 
 def judge(
-    submission_id: str,
-    language: typing.Tuple[str, typing.Optional[int]],
-    compiler: typing.Tuple[str, typing.Union[typing.Literal["latest"], str]],
-    test_range: typing.Tuple[int, int],
-    test_file: typing.Tuple[str, str],
-    test_type: typing.Literal["file", "std"],
-    judge_mode: declare.JudgeMode,
-    limit: declare.Limit,
-    abort: utils.Event,
+        submission_id: str,
+        language: typing.Tuple[str, typing.Optional[int]],
+        compiler: typing.Tuple[str, typing.Union[typing.Literal["latest"], str]],
+        test_range: typing.Tuple[int, int],
+        test_file: typing.Tuple[str, str],
+        test_type: typing.Literal["file", "std"],
+        judge_mode: declare.JudgeMode,
+        limit: declare.Limit,
+        abort: utils.Event,
+        _judge_dir: str = None,
 ) -> typing.Iterator[
     tuple[typing.Literal["compile", "overall"] | int, str, dict[str, str | int] | None]
 ]:  # [position, status, data]
+    global judge_dir
+    if _judge_dir:
+        judge_dir = _judge_dir
+
+    execution_dir = os.path.join(judge_dir, "execution")
+    testcases_dir = os.path.join(judge_dir, "testcases")
+    os.makedirs(testcases_dir, exist_ok=True)
+    os.makedirs(execution_dir, exist_ok=True)
+
     file = declare.Language[language[0]]
     code = file.file.format(id=submission_id)
     executable = file.executable.format(id=submission_id)
@@ -221,10 +198,10 @@ def judge(
             JUDGYSE_DIR = os.getenv("JUDGYSE_DIR", "/judgyse")
             _execution_dir = os.path.join(JUDGYSE_DIR, *execution_dir.split("/")[2:])
             _testcases_dir = os.path.join(JUDGYSE_DIR, *testcases_dir.split("/")[2:])
-        
+
         if RUN_IN_DOCKER:
             command = f'/usr/bin/time --format="--judgyse_static:amemory=%K,pmemory=%M,return=%x" {command.format(timeout="")}'
-        
+
         else:
             command = f'{TIME_PATH} --format="--judgyse_static:time=%e,amemory=%K,pmemory=%M,return=%x" ' \
                       f'{command.format(timeout=TIMEOUT_PATH)}'
@@ -311,16 +288,16 @@ def judge(
             continue
 
         except (
-            docker.errors.ContainerError,
-            docker.errors.APIError,
-            subprocess.CalledProcessError,
-            RUNTIME_ERROR,
+                docker.errors.ContainerError,
+                docker.errors.APIError,
+                subprocess.CalledProcessError,
+                RUNTIME_ERROR,
         ) as error:
-            raise error
+            # raise error
             raise SYSTEM_ERROR(*error.args) from error
 
         except Exception as e:
-            raise e
+            # raise e
             raise UNKNOWN_ERROR(*e.args) from e
 
         comp = compare(output, expect, judge_mode)

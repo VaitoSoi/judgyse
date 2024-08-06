@@ -10,7 +10,6 @@ __all__ = [
     "write", 
     "read_json", 
     "write_json",
-    "remove_content",
     "str_to_timestamp",
     "get_fields",
     "padding",
@@ -38,19 +37,6 @@ def write_json(
     file: str, content: typing.Dict[str, typing.Any], indent=json_indent
 ) -> None:
     return write(file, json.dumps(content, indent=indent))
-
-
-def remove_content(folder: str, exclude: typing.List[str] = []) -> None:
-    for item in os.listdir(folder):
-        if item in exclude:
-            continue
-        path = os.path.join(folder, item)
-        if os.path.isfile(path):
-            os.unlink(path)
-        elif os.path.isdir(path):
-            shutil.rmtree(path)
-        else:  # never happend :D
-            raise LookupError(f"type of {path} is unknown")
 
 
 def str_to_timestamp(s: str) -> float:

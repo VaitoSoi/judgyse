@@ -1,9 +1,14 @@
-import fastapi
-import logging
 import asyncio
-from fastapi.responses import HTMLResponse
-from session import SessionManager
+import logging
 from contextlib import asynccontextmanager
+
+import fastapi
+from fastapi.responses import HTMLResponse
+
+try:
+    from .session import SessionManager
+except ImportError:
+    from session import SessionManager
 
 session_manager = SessionManager()
 logger = logging.getLogger("uvicorn.error")
@@ -15,7 +20,6 @@ async def lifespan(app: fastapi.FastAPI):
     if session_manager.status[0] != 'disconnect':
         session_manager.stop_recv.set()
         await session_manager.disconnect()
-        # await task
 
 
 app = fastapi.FastAPI(lifespan=lifespan)
@@ -38,12 +42,3 @@ async def status(response: HTMLResponse):
     else:
         response.status_code = fastapi.status.HTTP_503_SERVICE_UNAVAILABLE
         return "no session is running"
-
-
-@app.get("/is_judging", tags=["status"])
-async def is_judging():
-    if session_manager.status == "disconnect":
-        return {"is_judging": None}
-    return {
-        "is_judging": session_manager.judge_thread.is_alive() if session_manager.judge_thread else False
-    }
