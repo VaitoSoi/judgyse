@@ -6,17 +6,12 @@ import typing
 import zlib
 
 import fastapi
+import judge
 
-try:
-    from . import judge, utils, exception
-    from .. import declare
-    from ..declare import JudgeSession, Language
-except ImportError:
-    import judge
-    import utils
-    import exception
-    import declare
-    from declare import JudgeSession, Language
+import declare
+import exception
+import utils
+from declare import JudgeSession, Language
 
 Status = typing.Literal["busy", "idle", "disconnect"]
 HEARTBEAT_INTERVAL = os.getenv("HEARTBEAT_INTERVAL", 3)
@@ -24,10 +19,7 @@ HEARTBEAT_INTERVAL = os.getenv("HEARTBEAT_INTERVAL", 3)
 
 class SessionManager:
     ws: fastapi.WebSocket = None
-    status: typing.Tuple[
-        Status,
-        typing.Optional[str],
-    ] = ["disconnect"]
+    status: declare.Status = declare.Status(status="idle")
     session: JudgeSession
     judge_abort: utils.Event = None  # noqa
     logger: logging.Logger = logging.getLogger("uvicorn.error")
@@ -46,7 +38,7 @@ class SessionManager:
         if self.judge_abort:
             self.judge_abort.set()
 
-        self.status = [status]
+        self.status = declare.Status(status=status)
         self.session = {}
         self.judge_abort = None
 
@@ -139,7 +131,7 @@ class SessionManager:
     async def handle(self, command: str, parsed: typing.Any) -> None:
         match command:
             case "start":
-                self.status = ["busy"]
+                self.status = declare.Status(status="busy")
                 self.session: declare = {}
                 self.judge_abort = utils.Event()
 
@@ -166,7 +158,7 @@ class SessionManager:
                             self.judge_abort,
                     ):
                         if isinstance(position, int):
-                            self.status = ["busy", str(position)]
+                            self.status = declare.Status(status="busy", progress=position)
 
                         result = declare.JudgeResult(
                             position=position,
@@ -186,7 +178,7 @@ class SessionManager:
                             "judge.error",
                             declare.JudgeResult(
                                 position="compiler",
-                                status=declare.Status.COMPILE_ERROR,
+                                status=declare.StatusCode.COMPILE_ERROR,
                                 error=str(error),
                             ).model_dump(),
                         ]
@@ -198,20 +190,21 @@ class SessionManager:
                             "judge.error",
                             declare.JudgeResult(
                                 position="system",
-                                status=declare.Status.SYSTEM_ERROR,
+                                status=declare.StatusCode.SYSTEM_ERROR,
                                 error=str(error),
                             ).model_dump(),
                         ]
                     )
 
                 except exception.UNKNOWN_ERROR as error:
+                    # raise error from error
                     self.logger.error(error)
                     await self.send(
                         [
                             "judge.error",
                             declare.JudgeResult(
                                 position="system",
-                                status=declare.Status.SYSTEM_ERROR,
+                                status=declare.StatusCode.SYSTEM_ERROR,
                                 error=str(error),
                             ).model_dump(),
                         ]
@@ -224,7 +217,7 @@ class SessionManager:
                 self.judge_abort.set()
 
             case "status":
-                await self.send(["status", self.status])
+                await self.send(["status", self.status.model_dump()])
 
             case _:
                 raise exception.CommandNotFound(f"unknown command: {command}")

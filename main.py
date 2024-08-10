@@ -5,10 +5,7 @@ from contextlib import asynccontextmanager
 import fastapi
 from fastapi.responses import HTMLResponse
 
-try:
-    from .session import SessionManager
-except ImportError:
-    from session import SessionManager
+from session import SessionManager
 
 session_manager = SessionManager()
 logger = logging.getLogger("uvicorn.error")
