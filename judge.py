@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import typing
+import ast
 
 import docker
 import docker.errors
@@ -21,6 +22,7 @@ from exception import (
     SYSTEM_ERROR,
     RUNTIME_ERROR,
     UNKNOWN_ERROR,
+    JUDGER_ERROR
 )
 
 __all__ = [
@@ -58,13 +60,17 @@ else:
 
 execution_dir = os.path.join(judge_dir, "execution")
 testcases_dir = os.path.join(judge_dir, "testcases")
+WIPE = os.getenv("WIPE", None) == "1"
+if WIPE:
+    shutil.rmtree(execution_dir)
+    shutil.rmtree(testcases_dir)
 os.makedirs(execution_dir, exist_ok=True)
 os.makedirs(testcases_dir, exist_ok=True)
 
 HARD_LIMIT = os.getenv("HARD_LIMIT", None) == "1"
 COMPILER_MEM_LIMIT = os.getenv("COMPILER_MEM_LIMIT", "1024m")
-TIME_PATH = os.getenv("TIME_PATH", "/usr/bin/time")
-TIMEOUT_PATH = os.getenv("TIMEOUT_PATH", "/usr/bin/timeout")
+TIME_PATH = os.getenv("TIME_PATH", None)
+TIMEOUT_PATH = os.getenv("TIMEOUT_PATH", None)
 if HARD_LIMIT:
     if not os.path.exists(TIME_PATH):
         raise Exception(f"{TIME_PATH} not found")
@@ -85,10 +91,11 @@ def judge(
         test_type: typing.Literal["file", "std"],
         judge_mode: declare.JudgeMode,
         limit: declare.Limit,
+        point_per_testcase: float,
         abort: utils.Event,
 ) -> typing.Iterator[tuple[
     typing.Literal["compile", "overall"] | int,
-    str,
+    declare.StatusCode,
     dict[str, str | int] | None
 ]]:  # [position, status, data]
     file = declare.Language[language[0]]
@@ -138,7 +145,7 @@ def judge(
             )
 
         if warn:
-            yield "compiler", declare.StatusCode.COMPILE_WARN.value, {"warn": warn}
+            yield "compiler", None, {"message": warn}
     except (docker.errors.ContainerError, subprocess.CalledProcessError) as e:
         raise COMPILE_ERROR(*e.args) from e
 
@@ -164,7 +171,7 @@ def judge(
             raise ABORTED()
 
         time: float = -1
-        memory: int = -1
+        memory: tuple[int, int] = [-1, -1]
         output = ""
         expect = utils.read(os.path.join(testcases_dir, str(i), test_file[1]))
 
@@ -187,8 +194,9 @@ def judge(
                       f'{command.format(timeout="")}'
 
         else:
-            command = f'{TIME_PATH} --format="--judgyse_static:time=%e,amemory=%K,pmemory=%M,return=%x" ' \
-                      f'{command.format(timeout=f"{TIMEOUT_PATH} {limit.time}")}'
+            command = \
+                f'{TIME_PATH or "/usr/bin/time"} --format="--judgyse_static:time=%e,amemory=%K,pmemory=%M,return=%x" ' \
+                f'{command.format(timeout=f"{TIMEOUT_PATH or "/usr/bin/timeout"} {limit.time}")}'
 
         try:
             if RUN_IN_DOCKER:
@@ -201,8 +209,8 @@ def judge(
                     working_dir="/execution",
                     volumes=[
                         f"{_execution_dir}:/execution",
-                        f"{TIME_PATH}:/usr/bin/time",
                         f"{_testcases_dir}/{i}/{test_file[0]}:/execution/{test_file[0]}",
+                        *([f"{TIME_PATH}:/usr/bin/time"] if TIME_PATH else []),
                     ]
                 )
                 container.wait(timeout=limit.time)
@@ -240,15 +248,15 @@ def judge(
                 _output = callback.stdout.decode()
                 statics = callback.stderr.decode().split('--judgyse_static:')[-1][:-2]
 
-                statics = wrap(
-                    [tuple(static.split("=")) for static in statics.split(",")]
-                )
+                statics = wrap([tuple(static.split("=")) for static in statics.split(",")])
                 time = float(statics["time"])
                 memory = (int(statics["amemory"]) / 1024, int(statics["pmemory"]) / 1024)
+                if memory[1] > limit.memory:
+                    raise MEMORYLIMIT_EXCEEDED()
                 return_code = int(statics["return"])
 
             if return_code != 0:
-                raise RUNTIME_ERROR("return code is not 0")
+                raise RUNTIME_ERROR(_output)
 
             if test_type == "file":
                 output = utils.read(os.path.join(execution_dir, test_file[1]))
@@ -256,11 +264,15 @@ def judge(
             else:
                 output = _output
 
+        except RUNTIME_ERROR as e:
+            yield from yield_and_save((i, declare.StatusCode.RUNTIME_ERROR.value, str(e.args[0])))
+            continue
+
         except MEMORYLIMIT_EXCEEDED:
             yield from yield_and_save((i, declare.StatusCode.MEMORY_LIMIT_EXCEEDED.value))
             continue
 
-        except TIMELIMIT_EXCEEDED:
+        except (TIMELIMIT_EXCEEDED, subprocess.TimeoutExpired):
             yield from yield_and_save((i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value))
             continue
 
@@ -278,22 +290,81 @@ def judge(
         except (
                 docker.errors.ContainerError,
                 docker.errors.APIError,
-                subprocess.CalledProcessError,
-                RUNTIME_ERROR,
+                subprocess.CalledProcessError
         ) as error:
-            raise error
+            # raise error
             raise SYSTEM_ERROR(*error.args) from error
 
         except Exception as e:
             raise e from e
             # raise UNKNOWN_ERROR(*e.args) from e
 
-        comp = compare(output, expect, judge_mode)
+        status: int = None
+        point = 0
+        feedback = None
+        if judge_mode.mode == 0:
+            a = output
+            b = expect
+            if judge_mode.trim_endl:
+                a = "\n".join([a for a in a.split("\n") if a])
+                b = "\n".join([b for b in b.split("\n") if b])
+            if judge_mode.case:
+                a = a.lower()
+                b = b.lower()
+            comp = a == b
+            point = point_per_testcase if comp else 0
+            status = declare.StatusCode.ACCEPTED.value if comp else declare.StatusCode.WRONG_ANSWER.value
+            feedback = "Accepted :D" if comp else output
+
+        elif judge_mode.mode == 1:
+            command = (f'python -c "import main from judger; '
+                       f'print(main({output}, {expect}, '
+                       f'{{"index": {i}, "point": {point_per_testcase}, "language": "{language[0]}", '
+                       f'"time": {time}, "memory": {memory}}}))"')
+            judger_output = None
+            try:
+                if RUN_IN_DOCKER:
+                    judger_output = DockerClient.containers.run(
+                        image="python:latest",
+                        command=command,
+                        detach=False,
+                        network_disabled=False,
+                        working_dir="/execution",
+                        volumes=[f"{execution_dir}:/execution"],
+                    ).decode()
+                else:
+                    judger_output = subprocess.run(
+                        command.split(),
+                        capture_output=True,
+                        check=True,
+                        cwd=execution_dir
+                    ).stdout.decode()
+
+            except (subprocess.CalledProcessError,
+                    docker.errors.ContainerError) as error:
+                raise JUDGER_ERROR(*error.args) from error
+
+            except docker.errors.APIError as error:
+                raise SYSTEM_ERROR(*error.args) from error
+
+            judger_output = ast.literal_eval(judger_output)
+            if isinstance(judger_output, bool):
+                status = declare.StatusCode.ACCEPTED.value if judger_output else declare.StatusCode.WRONG_ANSWER.value
+                point = point_per_testcase if judger_output else 0
+                feedback = "Accepted :D" if judger_output else output
+
+            elif isinstance(judger_output, dict):
+                status = judger_output.get("status", None)
+                point = judger_output.get("point", None)
+                feedback = judger_output.get("feedback", "Accepted :D" if status == 0 else output)
+                if status is None or point is None:
+                    raise JUDGER_ERROR("Invalid output from judger")
+
         yield from yield_and_save(
             (
                 i,
-                declare.StatusCode.ACCEPTED.value if comp else declare.StatusCode.WRONG_ANSWER.value,
-                {"time": time, "memory": memory},
+                status,
+                {"time": time, "memory": memory, "point": point, "feedback": feedback},
             )
         )
 
@@ -301,16 +372,3 @@ def judge(
     judge_status = results[0]
 
     yield "overall", judge_status[1], {}
-
-
-def compare(a: str, b: str, mode: declare.JudgeMode) -> bool:
-    if mode.mode == 0:
-        if mode.trim_endl:
-            a = "\n".join([a for a in a.split("\n") if a])
-            b = "\n".join([b for b in b.split("\n") if b])
-        if mode.case:
-            a = a.lower()
-            b = b.lower()
-        return a == b
-    else:
-        pass

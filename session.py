@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import typing
-import zlib
+# import zlib
 
 import fastapi
 import judge
@@ -19,7 +19,7 @@ HEARTBEAT_INTERVAL = os.getenv("HEARTBEAT_INTERVAL", 3)
 
 class SessionManager:
     ws: fastapi.WebSocket = None
-    status: declare.Status = declare.Status(status="idle")
+    status: declare.Status = declare.Status(status="disconnect")
     session: JudgeSession
     judge_abort: utils.Event = None  # noqa
     logger: logging.Logger = logging.getLogger("uvicorn.error")
@@ -44,10 +44,7 @@ class SessionManager:
 
     async def disconnect(self, reason: tuple[int, str | None] = (1000,)) -> None:
         self.stop_recv.set()
-        if (
-                self.ws is not None
-                and self.ws.client_state != fastapi.websockets.WebSocketState.DISCONNECTED
-        ):
+        if self.ws is not None and self.ws.client_state != fastapi.websockets.WebSocketState.DISCONNECTED:
             try:
                 await self.ws.close(*reason)
             except Exception as error:
@@ -66,10 +63,7 @@ class SessionManager:
             if self.stop_recv.is_set():
                 return
 
-            if (
-                    self.ws is None
-                    or self.ws.client_state == fastapi.websockets.WebSocketState.DISCONNECTED
-            ):
+            if self.ws is None or self.ws.client_state == fastapi.websockets.WebSocketState.DISCONNECTED:
                 return await self.disconnect((1000, "client disconnected"))
 
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -95,8 +89,8 @@ class SessionManager:
                 if command == "close":
                     return await self.disconnect((1000, "client closed"))
 
-                if command.startswith("ping"):
-                    await self.send(["pong", data])
+                # elif command.startswith("ping"):
+                #     await self.send(["pong", data])
 
                 elif command.startswith("command."):
                     await self.handle(command[8:], data)
@@ -104,19 +98,7 @@ class SessionManager:
                 elif command.startswith("declare."):
                     if data is not None and len(data) > 0:
                         data = json.loads(data[0])
-
-                    match command[8:]:
-                        case 'env':
-                            os.environ.update(data)
-
-                        case "language":
-                            utils.write_json(declare.judge.language_json, data)
-
-                        case "compiler":
-                            utils.write_json(declare.judge.compiler_json, data)
-
-                        case "load":
-                            declare.judge.load()
+                    self.declare(command[8:], data)
 
                 else:
                     await self.messages.put([command, data])
@@ -124,9 +106,43 @@ class SessionManager:
         except fastapi.websockets.WebSocketDisconnect:
             return await self.disconnect()
 
+        except exception.InvalidTestcaseIndex as error:
+            await self.send(["judge.write:testcase",
+                             {"status": 1, "code": "invalid_testcase_count",
+                              "error": f"invalid testcase index: {error.args[0]}"}])
+
+        except exception.MissingField as error:
+            await self.send(["judge.write:code",
+                             {"status": 1, "code": "missing_field",
+                              "error": f"missing field: {error.args[0]}"}])
+
+        except exception.InvalidField as error:
+            await self.send(["judge.write:code",
+                             {"status": 1, "code": "invalid_field",
+                              "error": f"invalid field {error.args[0][0]}: "
+                                       f"expected {error.args[0][1]}, got {error.args[0][2]}"}])
+
+        except exception.CommandNotFound as error:
+            await self.send(["unknown", str(error)])
+
         except Exception as error:
             raise error from error
             # await self.send(["error", str(error)])
+
+    @staticmethod
+    def declare(command: str, data: typing.Any) -> None:
+        match command:
+            case 'env':
+                os.environ.update(data)
+
+            case "language":
+                utils.write_json(declare.judge.language_json, data)
+
+            case "compiler":
+                utils.write_json(declare.judge.compiler_json, data)
+
+            case "load":
+                declare.judge.load()
 
     async def handle(self, command: str, parsed: typing.Any) -> None:
         match command:
@@ -155,60 +171,62 @@ class SessionManager:
                             self.session.test_type,
                             self.session.judge_mode,
                             self.session.limit,
+                            self.session.point,
                             self.judge_abort,
                     ):
-                        if isinstance(position, int):
-                            self.status = declare.Status(status="busy", progress=position)
+                        if position == "compiler":
+                            await self.send([
+                                "judge.compiler",
+                                str(data.get("message")),
+                            ])
 
-                        result = declare.JudgeResult(
-                            position=position,
-                            status=status,
-                            warn=data.get("warn"),
-                            time=data.get("time"),
-                            memory=data.get("memory"),
-                        ).model_dump()
-                        await self.send(["judge.result", result])
+                        elif position == "overall":
+                            await self.send(["judge.overall", status])
+
+                        elif isinstance(position, int):
+                            self.status = declare.Status(status="busy", progress=position.__str__())
+                            await self.send(["judge.result", declare.JudgeResult(
+                                position=position,
+                                status=status,
+                                error=data.get("error", None),
+                                time=data.get("time", None),
+                                memory=data.get("memory", None),
+                                point=data.get("point", None),
+                                feedback=data.get("feedback", None),
+                            ).model_dump()])
+
+                        else:
+                            self.logger.error(f"unknown position: {position}")
+                            self.logger.error(f"{position} {status} {data}")
 
                 except exception.ABORTED:
+                    self.logger.info("judge aborted")
                     await self.send(["judge.aborted"])
 
                 except exception.COMPILE_ERROR as error:
-                    await self.send(
-                        [
-                            "judge.error",
-                            declare.JudgeResult(
-                                position="compiler",
-                                status=declare.StatusCode.COMPILE_ERROR,
-                                error=str(error),
-                            ).model_dump(),
-                        ]
-                    )
+                    self.logger.error("compile error, detail")
+                    self.logger.exception(error)
+                    await self.send([
+                        "judge.error:compiler",
+                        error.__str__(),
+                    ])
 
                 except exception.SYSTEM_ERROR as error:
-                    await self.send(
-                        [
-                            "judge.error",
-                            declare.JudgeResult(
-                                position="system",
-                                status=declare.StatusCode.SYSTEM_ERROR,
-                                error=str(error),
-                            ).model_dump(),
-                        ]
-                    )
+                    self.logger.error("system error, detail")
+                    self.logger.exception(error)
+                    await self.send([
+                        "judge.error:system",
+                        error.__str__(),
+                    ])
 
                 except exception.UNKNOWN_ERROR as error:
                     # raise error from error
-                    self.logger.error(error)
-                    await self.send(
-                        [
-                            "judge.error",
-                            declare.JudgeResult(
-                                position="system",
-                                status=declare.StatusCode.SYSTEM_ERROR,
-                                error=str(error),
-                            ).model_dump(),
-                        ]
-                    )
+                    self.logger.error("unknown error, detail")
+                    self.logger.exception(error)
+                    await self.send([
+                        "judge.error:system",
+                        error.__str__(),
+                    ])
 
                 await self.send(["judge.done"])
                 self.clear()
@@ -227,24 +245,57 @@ class SessionManager:
 
         for field in strict:
             if field not in data:
-                raise exception.MissingField(f"missing field: {field}")
+                raise exception.MissingField(field)
+
+        submission_id = data["submission_id"]
+        language = data["language"]
+        compiler = data["compiler"]
+        test_range = data["test_range"]
+        test_file = data["test_file"]
+        test_type = data["test_type"]
+        judge_mode = data["judge_mode"]
+        limit = data["limit"]
+        point = data["point"]
+
+        if not isinstance(submission_id, str):
+            raise exception.InvalidField("submission_id", "str", type(submission_id))
+        if not isinstance(language, list) or len(language) != 2:
+            raise exception.InvalidField("language", "list(2)", type(language))
+        if not isinstance(compiler, list) or len(compiler) != 2:
+            raise exception.InvalidField("compiler", "list(2)", type(compiler))
+        if not isinstance(test_range, list) or len(test_range) != 2:
+            raise exception.InvalidField("test_range", "list(2)", type(test_range))
+        if not isinstance(test_file, list) or len(test_file) != 2:
+            raise exception.InvalidField("test_file", "list(2)", type(test_file))
+        if not isinstance(test_type, str):
+            raise exception.InvalidField("test_type", "str", type(test_type))
+        if test_type not in ["file", "std"]:
+            raise exception.InvalidField("test_type", "file, std", test_type)
+        if not isinstance(judge_mode, dict):
+            raise exception.InvalidField("judge_mode", "dict", type(judge_mode))
+        if not isinstance(limit, dict):
+            raise exception.InvalidField("limit", "dict", type(limit))
+        if not isinstance(point, float):
+            raise exception.InvalidField("point", "float", type(point))
 
         self.session = JudgeSession(
-            submission_id=data["submission_id"],
-            language=(data["language"][0], data["language"][1]),
-            compiler=(data["compiler"][0], data["compiler"][1]),
-            test_range=(data["test_range"][0], data["test_range"][1]),
-            test_file=(data["test_file"][0], data["test_file"][1]),
-            test_type=data["test_type"],
-            judge_mode=declare.JudgeMode(**data["judge_mode"]),
-            limit=declare.Limit(**data["limit"]),
+            submission_id=submission_id,
+            language=tuple(language),
+            compiler=tuple(compiler),
+            test_range=tuple(test_range),
+            test_file=tuple(test_file),
+            test_type=test_type,
+            judge_mode=declare.JudgeMode(**judge_mode),
+            limit=declare.Limit(**limit),
+            point=point,
         )
 
-        await self.send(["judge.initialized"])
+        await self.send(["judge.init", {"status": 0}])
 
     async def write_testcase(self, data: typing.Tuple[int, str, str, bool]) -> None:
         if data[0] not in range(
-                self.session.test_range[0], self.session.test_range[1] + 1
+                self.session.test_range[0],
+                self.session.test_range[1] + 1
         ):
             raise exception.InvalidTestcaseIndex(data[0])
 
@@ -253,10 +304,10 @@ class SessionManager:
 
         input_content = data[1]
         output_content = data[2]
-        compressed = data[3]
-        if compressed:
-            input_content = zlib.decompress(input_content)
-            output_content = zlib.decompress(output_content)
+        # compressed = data[3]
+        # if compressed:
+        #     input_content = zlib.decompress(input_content)
+        #     output_content = zlib.decompress(output_content)
 
         utils.write(
             os.path.join(judge.testcases_dir, str(data[0]), self.session.test_file[0]),
@@ -266,16 +317,25 @@ class SessionManager:
             os.path.join(judge.testcases_dir, str(data[0]), self.session.test_file[1]),
             output_content,
         )
-        await self.send(["judge.written:testcase", data[0]])
+        await self.send(["judge.write:testcase", {"status": 0, "index": data[0]}])
 
     async def write_code(self, data: typing.Tuple[str, bool]) -> None:
         file_name = Language[self.session.language[0]].file.format(
             id=self.session.submission_id
         )
         file_content = data[0]
-        compressed = data[1]
-        if compressed:
-            file_content = zlib.decompress(file_content)
+        # compressed = data[1]
+        # if compressed:
+        #     file_content = zlib.decompress(file_content)
         utils.write(os.path.join(judge.execution_dir, file_name), file_content)
 
-        await self.send(["judge.written:code"])
+        await self.send(["judge.write:code", {"status": 0}])
+
+    async def write_judger(self, data: typing.Tuple[str, bool]) -> None:
+        file_content = data[0]
+        # compressed = data[1]
+        # if compressed:
+        #     file_content = zlib.decompress(file_content)
+        utils.write(os.path.join(judge.execution_dir, "judger.py"), file_content)
+
+        await self.send(["judge.write:judger", {"status": 0}])

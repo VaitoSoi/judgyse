@@ -6,11 +6,11 @@ class MissingField(ValueError):
     pass
 
 
-class CommandNotFound(ValueError):
+class InvalidField(ValueError):
     pass
 
 
-class NoActiveThread(ValueError):
+class CommandNotFound(ValueError):
     pass
 
 
@@ -41,3 +41,6 @@ class RUNTIME_ERROR(Exception):
 class UNKNOWN_ERROR(Exception):
     pass
 
+
+class JUDGER_ERROR(Exception):
+    pass

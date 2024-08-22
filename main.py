@@ -6,27 +6,47 @@ import fastapi
 from fastapi.responses import HTMLResponse
 
 from session import SessionManager
+import utils
 
 session_manager = SessionManager()
 logger = logging.getLogger("uvicorn.error")
+
+justyse_logger = logging.getLogger("justyse")
+justyse_logger.propagate = False
+justyse_logger.setLevel(logging.DEBUG)
+
+uvicorn_logger = logging.getLogger("uvicorn")
+uvicorn_logger.handlers.clear()
+uvicorn_error_logger = logging.getLogger("uvicorn.error")
+uvicorn_error_logger.handlers.clear()
+uvicorn_error_logger.addHandler(utils.console_handler("Uvicorn"))
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.handlers.clear()
+uvicorn_access_logger.addHandler(utils.console_handler("Access", utils.AccessFormatter))
+
+fastapi_logger = logging.getLogger("fastapi")
+fastapi_logger.handlers.clear()
+fastapi_logger.addHandler(utils.console_handler("FastAPI"))
 
 
 @asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
     yield
-    if session_manager.status[0] != 'disconnect':
+    if session_manager.status.status != 'disconnect':
         session_manager.stop_recv.set()
         await session_manager.disconnect()
 
 
-app = fastapi.FastAPI(lifespan=lifespan)
+app = fastapi.FastAPI(
+    title="Judgyse Server",
+    lifespan=lifespan
+)
 
 
 @app.websocket("/session")
 async def session(ws: fastapi.WebSocket):
     await ws.accept()
-    if session_manager.status[0] != "disconnect":
-        print("busy")
+    if session_manager.status.status != "disconnect":
         return await ws.close(fastapi.status.WS_1013_TRY_AGAIN_LATER, "busy")
     session_manager.connect(ws)
     await asyncio.gather(session_manager.recv(), session_manager.is_alive())
