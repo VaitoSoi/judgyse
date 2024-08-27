@@ -3,30 +3,37 @@ import json
 import logging
 import os
 import typing
-# import zlib
+import threading
+import queue
 
 import fastapi
-import judge
 
 import declare
 import exception
+import judge
 import utils
 from declare import JudgeSession, Language
 
+# import zlib
+
 Status = typing.Literal["busy", "idle", "disconnect"]
 HEARTBEAT_INTERVAL = os.getenv("HEARTBEAT_INTERVAL", 3)
+MSG_TIMEOUT = os.getenv("MSG_TIMEOUT", 5)
 
 
 class SessionManager:
+    logger: logging.Logger
     ws: fastapi.WebSocket = None
     status: declare.Status = declare.Status(status="disconnect")
     session: JudgeSession
-    judge_abort: utils.Event = None  # noqa
-    logger: logging.Logger = logging.getLogger("uvicorn.error")
+    judge_abort: asyncio.Event = None  # noqa
     messages: asyncio.Queue = asyncio.Queue()
     stop_recv: asyncio.Event = asyncio.Event()
+    judge_thread: threading.Thread = None
 
     def __init__(self) -> None:
+        self.logger = logging.getLogger("judgyse.session")
+        self.logger.addHandler(utils.console_handler("Session"))
         pass
 
     def connect(self, ws: fastapi.WebSocket) -> None:
@@ -56,7 +63,7 @@ class SessionManager:
     async def send(self, data: typing.Any):
         await asyncio.sleep(0)
         await self.ws.send_json(data)
-        self.logger.info(f"sent {data}")
+        self.logger.debug(f"sent {data}")
 
     async def is_alive(self):
         while True:
@@ -75,7 +82,7 @@ class SessionManager:
                     self.logger.info("stop recv")
                     break
 
-                self.logger.info(f"received {message}")
+                self.logger.debug(f"received {message}")
 
                 command: str
                 data: typing.Any
@@ -149,7 +156,9 @@ class SessionManager:
             case "start":
                 self.status = declare.Status(status="busy")
                 self.session: declare = {}
-                self.judge_abort = utils.Event()
+                self.judge_abort = asyncio.Event()
+                utils.wipe_data(judge.execution_dir)
+                utils.wipe_data(judge.testcases_dir)
 
             case "init":
                 await self.parse_session(parsed)
@@ -157,10 +166,14 @@ class SessionManager:
             case "code":
                 await self.write_code(parsed)
 
+            case "judger":
+                await self.write_judger(parsed)
+
             case "testcase":
                 await self.write_testcase(parsed)
 
             case "judge":
+                # async def job():
                 try:
                     for position, status, data in judge.judge(
                             self.session.submission_id,
@@ -231,8 +244,66 @@ class SessionManager:
                 await self.send(["judge.done"])
                 self.clear()
 
-            case "abort":
-                self.judge_abort.set()
+                # msg_queue = queue.Queue()
+                # self.judge_thread = threading.Thread(
+                #     target=judge.thread_judge,
+                #     args=(
+                #         self.session.submission_id,
+                #         self.session.language,
+                #         self.session.compiler,
+                #         self.session.test_range,
+                #         self.session.test_file,
+                #         self.session.test_type,
+                #         self.session.judge_mode,
+                #         self.session.limit,
+                #         self.session.point,
+                #         self.judge_abort,
+                #         msg_queue,
+                #     ),
+                #     name=f"judge-{self.session.submission_id}",
+                # )
+                # self.judge_thread.start()
+                #
+                # while self.judge_thread.is_alive() or not msg_queue.empty():
+                #     try:
+                #         position, status, data = await asyncio.to_thread(msg_queue.get, timeout=MSG_TIMEOUT)
+                #
+                #     except queue.Empty:
+                #         continue
+                #
+                #     if position == "compiler":
+                #         await self.send([
+                #             "judge.compiler",
+                #             str(data.get("message")),
+                #         ])
+                #
+                #     elif position == "overall":
+                #         await self.send(["judge.overall", status])
+                #
+                #     elif isinstance(position, int):
+                #         self.status = declare.Status(status="busy", progress=position.__str__())
+                #         await self.send(["judge.result", declare.JudgeResult(
+                #             position=position,
+                #             status=status,
+                #             error=data.get("error", None),
+                #             time=data.get("time", None),
+                #             memory=data.get("memory", None),
+                #             point=data.get("point", None),
+                #             feedback=data.get("feedback", None),
+                #         ).model_dump()])
+                #
+                #     else:
+                #         self.logger.error(f"unknown position: {position}")
+                #         self.logger.error(f"{position} {status} {data}")
+                #
+                # await self.send(["judge.done"])
+                # self.clear()
+
+            # case "abort":
+            #     self.logger.debug("aborting judge")
+            #
+            #     if self.judge_abort:
+            #         self.judge_abort.set()
 
             case "status":
                 await self.send(["status", self.status.model_dump()])

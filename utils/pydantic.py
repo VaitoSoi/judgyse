@@ -1,6 +1,7 @@
 import pydantic
 import typing
 
+
 def get_fields(
     model: pydantic.BaseModel,
 ) -> typing.Tuple[list[str], list[str]]:

@@ -1,9 +1,13 @@
+import ast
+import asyncio
+import logging
 import os
+import queue
+import shlex
 import shutil
 import subprocess
 import sys
 import typing
-import ast
 
 import docker
 import docker.errors
@@ -34,12 +38,12 @@ __all__ = [
 ]
 
 INSIDE_DOCKER = os.getenv("INSIDE_DOCKER", None) == "1"
-RUN_IN_DOCKER = INSIDE_DOCKER or os.getenv("RUN_IN_DOCKER", None) == "1"
+RUN_IN_DOCKER = os.getenv("RUN_IN_DOCKER", None) == "1"  # or INSIDE_DOCKER
 if sys.platform == "nt" and not RUN_IN_DOCKER:
     raise Exception("Windows is not supported, use Docker instead")
 
 DockerClient: docker.DockerClient = None
-if RUN_IN_DOCKER:
+if RUN_IN_DOCKER or INSIDE_DOCKER:
     try:
         DockerClient = docker.from_env()
     except docker.errors.DockerException as error:
@@ -54,18 +58,22 @@ judge_dir: str = None
 if INSIDE_DOCKER:
     HOSTNAME = os.getenv("HOSTNAME", None)
     process_id = DockerClient.api.inspect_container(HOSTNAME)["Name"].split("_")[-1]
-    judge_dir = os.path.join(os.path.abspath("judge"), process_id[1:])
+    judge_dir = os.path.join(os.path.abspath("evaluation"), process_id[1:])
 else:
-    judge_dir = os.path.abspath("judge")
+    judge_dir = os.path.abspath("evaluation")
 
 execution_dir = os.path.join(judge_dir, "execution")
 testcases_dir = os.path.join(judge_dir, "testcases")
 WIPE = os.getenv("WIPE", None) == "1"
 if WIPE:
-    shutil.rmtree(execution_dir)
-    shutil.rmtree(testcases_dir)
-os.makedirs(execution_dir, exist_ok=True)
-os.makedirs(testcases_dir, exist_ok=True)
+    utils.wipe_data(execution_dir)
+    utils.wipe_data(testcases_dir)
+else:
+    if not os.path.exists(execution_dir):
+        os.makedirs(execution_dir)
+
+    if not os.path.exists(testcases_dir):
+        os.makedirs(testcases_dir, exist_ok=True)
 
 HARD_LIMIT = os.getenv("HARD_LIMIT", None) == "1"
 COMPILER_MEM_LIMIT = os.getenv("COMPILER_MEM_LIMIT", "1024m")
@@ -81,6 +89,66 @@ stt = utils.str_to_timestamp
 mem_parse = utils.mem_convert
 wrap = utils.wrap_dict
 
+logger = logging.getLogger("judgyse.judge")
+logger.addHandler(utils.console_handler("Judge"))
+
+
+def thread_judge(
+        submission_id: str,
+        language: typing.Tuple[str, typing.Optional[int]],
+        compiler: typing.Tuple[str, typing.Union[typing.Literal["latest"], str]],
+        test_range: typing.Tuple[int, int],
+        test_file: typing.Tuple[str, str],
+        test_type: typing.Literal["file", "std"],
+        judge_mode: declare.JudgeMode,
+        limit: declare.Limit,
+        point_per_testcase: float,
+        abort: asyncio.Event,
+        msg_queue: queue.Queue
+):
+    try:
+        for data in judge(submission_id,
+                          language,
+                          compiler,
+                          test_range,
+                          test_file,
+                          test_type,
+                          judge_mode,
+                          limit,
+                          point_per_testcase,
+                          abort):
+            msg_queue.put(data)
+
+    except ABORTED:
+        msg_queue.put([
+            "system",
+            "aborted",
+        ])
+
+    except COMPILE_ERROR as error:
+        # self.logger.error("compile error, detail")
+        # self.logger.exception(error)
+        msg_queue.put((
+            "compiler",
+            declare.StatusCode.COMPILE_ERROR.value,
+            error.__str__(),
+        ))
+
+    except SYSTEM_ERROR as error:
+        msg_queue.put([
+            "system",
+            declare.StatusCode.SYSTEM_ERROR.value,
+            error.__str__(),
+        ])
+
+    except UNKNOWN_ERROR as error:
+        # raise error from error
+        msg_queue.put([
+            "system",
+            declare.StatusCode.UNKNOWN_ERROR.value,
+            error.__str__(),
+        ])
+
 
 def judge(
         submission_id: str,
@@ -92,12 +160,10 @@ def judge(
         judge_mode: declare.JudgeMode,
         limit: declare.Limit,
         point_per_testcase: float,
-        abort: utils.Event,
-) -> typing.Iterator[tuple[
-    typing.Literal["compile", "overall"] | int,
-    declare.StatusCode,
-    dict[str, str | int] | None
-]]:  # [position, status, data]
+        abort: asyncio.Event
+) -> typing.Iterator[
+    tuple[typing.Literal["compiler", "system"] | int, declare.StatusCode, dict[str, str | int] | None]
+]:
     file = declare.Language[language[0]]
     code = file.file.format(id=submission_id)
     executable = file.executable.format(id=submission_id)
@@ -110,6 +176,7 @@ def judge(
         version=language[1]
     )
     execute = command.execute.format(executable=executable)
+    print(compile, execute)
 
     """
     Compile
@@ -133,7 +200,7 @@ def judge(
             warn = callback.stdout.decode()
 
         else:
-            warn = DockerClient.containers.run(
+            warn: bytes = DockerClient.containers.run(
                 image=image,
                 command=compile,
                 detach=False,
@@ -143,9 +210,11 @@ def judge(
                 working_dir="/compile",
                 mem_limit=COMPILER_MEM_LIMIT,
             )
+            warn = warn.decode()
 
         if warn:
-            yield "compiler", None, {"message": warn}
+            yield "compiler", "warn", {"message": warn}
+
     except (docker.errors.ContainerError, subprocess.CalledProcessError) as e:
         raise COMPILE_ERROR(*e.args) from e
 
@@ -161,13 +230,14 @@ def judge(
 
     results: typing.List[declare.JudgeResult] = []
 
-    def yield_and_save(data: typing.Any):
+    def save(*data: typing.Any):
         data = utils.padding(data, 3, {})
         results.append(data)
-        yield data[0], data[1], data[2]
+        yield data
 
     for i in range(test_range[0], test_range[1] + 1, 1):
         if abort.is_set():
+            logger.debug("Aborted")
             raise ABORTED()
 
         time: float = -1
@@ -177,10 +247,13 @@ def judge(
 
         command = f"{{timeout}} {execute}"
         if test_type == "std":
-            command = f"cat {test_file[0]} | {execute}"
+            command = f'cat {test_file[0]} | {execute}'
 
         if HARD_LIMIT:
-            command = f'/bin/bash -c "ulimit -v {mem_parse(limit.memory)} && {command}"'
+            command = f'ulimit -v {mem_parse(limit.memory)} && /bin/bash -c "{command}"'
+
+        else:
+            command = f'/bin/bash -c "{command}"'
 
         _execution_dir = execution_dir
         _testcases_dir = testcases_dir
@@ -190,7 +263,7 @@ def judge(
             _testcases_dir = os.path.join(JUDGYSE_DIR, *testcases_dir.split("/")[2:])
 
         if RUN_IN_DOCKER:
-            command = f'/usr/bin/time --format="--judgyse_static:amemory=%K,pmemory=%M,return=%x"' \
+            command = f'/usr/bin/time --format="--judgyse_static:amemory=%K,pmemory=%M,return=%x" ' \
                       f'{command.format(timeout="")}'
 
         else:
@@ -199,7 +272,30 @@ def judge(
                 f'{command.format(timeout=f"{TIMEOUT_PATH or "/usr/bin/timeout"} {limit.time}")}'
 
         try:
-            if RUN_IN_DOCKER:
+            if not RUN_IN_DOCKER or INSIDE_DOCKER:
+                shutil.copyfile(
+                    os.path.join(testcases_dir, str(i), test_file[0]),
+                    os.path.join(_execution_dir, test_file[0])
+                )
+                callback = subprocess.run(
+                    shlex.split(command),
+                    cwd=_execution_dir,
+                    capture_output=True,
+                    timeout=limit.time,
+                    check=True,
+                )
+                _output = callback.stdout.decode()
+                statics = callback.stderr.decode().split('--judgyse_static:')[-1][:-1]
+
+                statics = wrap([tuple(static.split("=")) for static in statics.split(",")])
+                time = float(statics["time"])
+                memory = (int(statics["amemory"]) / 1024, int(statics["pmemory"]) / 1024)
+                if memory[1] > mem_parse(limit.memory):
+                    raise MEMORYLIMIT_EXCEEDED()
+                return_code = int(statics["return"])
+
+            else:
+                # print(command)
                 container: docker.models.containers.Container = DockerClient.containers.run(
                     image=image,
                     command=command,
@@ -233,28 +329,6 @@ def judge(
 
                 container.remove()
 
-            else:
-                shutil.copyfile(
-                    os.path.join(testcases_dir, str(i), test_file[0]),
-                    os.path.join(_execution_dir, test_file[0])
-                )
-                callback = subprocess.run(
-                    command.split(),
-                    cwd=_execution_dir,
-                    capture_output=True,
-                    timeout=limit.time,
-                    check=True,
-                )
-                _output = callback.stdout.decode()
-                statics = callback.stderr.decode().split('--judgyse_static:')[-1][:-2]
-
-                statics = wrap([tuple(static.split("=")) for static in statics.split(",")])
-                time = float(statics["time"])
-                memory = (int(statics["amemory"]) / 1024, int(statics["pmemory"]) / 1024)
-                if memory[1] > limit.memory:
-                    raise MEMORYLIMIT_EXCEEDED()
-                return_code = int(statics["return"])
-
             if return_code != 0:
                 raise RUNTIME_ERROR(_output)
 
@@ -265,26 +339,26 @@ def judge(
                 output = _output
 
         except RUNTIME_ERROR as e:
-            yield from yield_and_save((i, declare.StatusCode.RUNTIME_ERROR.value, str(e.args[0])))
+            yield from save(i, declare.StatusCode.RUNTIME_ERROR.value, str(e.args[0]))
             continue
 
         except MEMORYLIMIT_EXCEEDED:
-            yield from yield_and_save((i, declare.StatusCode.MEMORY_LIMIT_EXCEEDED.value))
+            yield from save(i, declare.StatusCode.MEMORY_LIMIT_EXCEEDED.value)
             continue
 
         except (TIMELIMIT_EXCEEDED, subprocess.TimeoutExpired):
-            yield from yield_and_save((i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value))
+            yield from save(i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value)
             continue
 
         except requests.exceptions.ConnectionError as e:
             if urllib3.exceptions.ReadTimeoutError in e.args:
-                yield from yield_and_save((i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value, str(e)))
+                yield from save(i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value, str(e))
                 continue
 
             else:
                 raise SYSTEM_ERROR(*e.args) from e
         except subprocess.TimeoutExpired:
-            yield from yield_and_save((i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value))
+            yield from save(i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value)
             continue
 
         except (
@@ -360,12 +434,10 @@ def judge(
                 if status is None or point is None:
                     raise JUDGER_ERROR("Invalid output from judger")
 
-        yield from yield_and_save(
-            (
-                i,
-                status,
-                {"time": time, "memory": memory, "point": point, "feedback": feedback},
-            )
+        yield from save(
+            i,
+            status,
+            {"time": time, "memory": memory, "point": point, "feedback": feedback},
         )
 
     results.sort(reverse=True, key=lambda x: x[1])

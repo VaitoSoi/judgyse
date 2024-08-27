@@ -1,8 +1,9 @@
-from . import data, event, io, pydantic
-from .data import str_to_timestamp, padding, mem_convert, wrap_dict
+from . import data, event, io, pydantic, logging
+from .data import str_to_timestamp, padding, mem_convert, wrap_dict, wipe_data
 from .event import Event
 from .io import read, write, read_json, write_json
 from .pydantic import get_fields
+from .logging import console_handler, formatter, AccessFormatter, ColorizedFormatter
 
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "event",
     "io",
     "pydantic",
+    "logging",
     "read", 
     "write", 
     "read_json", 
@@ -19,5 +21,10 @@ __all__ = [
     "padding",
     "mem_convert",
     "wrap_dict",
+    "wipe_data",
     "Event",
+    "console_handler",
+    "formatter",
+    "AccessFormatter",
+    "ColorizedFormatter",
 ]

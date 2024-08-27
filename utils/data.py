@@ -1,5 +1,8 @@
 from datetime import datetime
 import typing
+import os
+import shutil
+
 
 def str_to_timestamp(s: str) -> float:
     s = s[:26]
@@ -25,3 +28,9 @@ def mem_convert(mem: str) -> int:
 
 def wrap_dict(key_val: list[tuple[str, str]]) -> dict[str, str]:
     return {key: val for key, val in key_val}
+
+
+def wipe_data(dir: str):
+    if os.path.exists(dir):
+        shutil.rmtree(dir)
+    os.makedirs(dir)

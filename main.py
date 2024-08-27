@@ -1,19 +1,23 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import fastapi
 from fastapi.responses import HTMLResponse
 
-from session import SessionManager
 import utils
+from session import SessionManager
+
+# print(os.environ)
 
 session_manager = SessionManager()
-logger = logging.getLogger("uvicorn.error")
 
-justyse_logger = logging.getLogger("justyse")
-justyse_logger.propagate = False
-justyse_logger.setLevel(logging.DEBUG)
+main_logger = logging.getLogger("judgyse.main")
+main_logger.addHandler(utils.console_handler("Main"))
+judgyse_logger = logging.getLogger("judgyse")
+judgyse_logger.propagate = False
+judgyse_logger.setLevel(os.getenv("LOG_LEVEL", "DEBUG"))
 
 uvicorn_logger = logging.getLogger("uvicorn")
 uvicorn_logger.handlers.clear()
@@ -47,6 +51,7 @@ app = fastapi.FastAPI(
 async def session(ws: fastapi.WebSocket):
     await ws.accept()
     if session_manager.status.status != "disconnect":
+        main_logger.debug("busy")
         return await ws.close(fastapi.status.WS_1013_TRY_AGAIN_LATER, "busy")
     session_manager.connect(ws)
     await asyncio.gather(session_manager.recv(), session_manager.is_alive())

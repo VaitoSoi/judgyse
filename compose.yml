@@ -2,7 +2,7 @@ services:
   judgyse:
     build: .
     ports:
-      - 8080-8081:8000
+      - 8080-8081:8080
     volumes:
       - //var/run/docker.sock://var/run/docker.sock
       - //usr/local/bin/time://usr/local/bin/time
