@@ -1,14 +1,14 @@
 services:
-  judgyse:
+  server:
     build: .
     ports:
       - 8080-8081:8080
     volumes:
-      - //var/run/docker.sock://var/run/docker.sock
-      - //usr/local/bin/time://usr/local/bin/time
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/local/bin/time:/usr/local/bin/time
       - ./:/judgyse
     networks:
-      - api
+      - net
     environment:
       INSIDE_DOCKER: "1"
       JUDGYSE_DIR: "${PWD}"
@@ -16,6 +16,6 @@ services:
     scale: 2
 
 networks:
-  api:
+  net:
     name: api
     external: true

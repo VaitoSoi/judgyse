@@ -81,7 +81,7 @@ class AccessFormatter(ColorizedFormatter):
 
 def formatter(name: str, formatter_: logging.Formatter = ColorizedFormatter):
     return formatter_( # noqa
-        f"%(asctime)s :: {name:<{10}} :: %(levelname)-7s :: %(message)s",
+        f"%(asctime)s.%(msecs)06d :: {name:<{10}} :: %(levelname)-7s :: %(message)s",
         "%Y-%m-%d %H:%M:%S"
     )
 

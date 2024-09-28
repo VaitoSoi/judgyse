@@ -38,7 +38,7 @@ __all__ = [
 ]
 
 INSIDE_DOCKER = os.getenv("INSIDE_DOCKER", None) == "1"
-RUN_IN_DOCKER = os.getenv("RUN_IN_DOCKER", None) == "1"  # or INSIDE_DOCKER
+RUN_IN_DOCKER = os.getenv("RUN_IN_DOCKER", None) == "1"
 if sys.platform == "nt" and not RUN_IN_DOCKER:
     raise Exception("Windows is not supported, use Docker instead")
 
@@ -176,7 +176,6 @@ def judge(
         version=language[1]
     )
     execute = command.execute.format(executable=executable)
-    print(compile, execute)
 
     """
     Compile
@@ -192,7 +191,7 @@ def judge(
             )
 
             callback = subprocess.run(
-                command.split(),
+                shlex.split(command),
                 cwd=execution_dir,
                 capture_output=True,
                 check=True,
@@ -245,7 +244,7 @@ def judge(
         output = ""
         expect = utils.read(os.path.join(testcases_dir, str(i), test_file[1]))
 
-        command = f"{{timeout}} {execute}"
+        command = f"{{timeout}}{execute}"
         if test_type == "std":
             command = f'cat {test_file[0]} | {execute}'
 
@@ -269,10 +268,10 @@ def judge(
         else:
             command = \
                 f'{TIME_PATH or "/usr/bin/time"} --format="--judgyse_static:time=%e,amemory=%K,pmemory=%M,return=%x" ' \
-                f'{command.format(timeout=f"{TIMEOUT_PATH or "/usr/bin/timeout"} {limit.time}")}'
+                f'{command.format(timeout=f"{TIMEOUT_PATH or "/usr/bin/timeout"} {limit.time} ")}'
 
         try:
-            if not RUN_IN_DOCKER or INSIDE_DOCKER:
+            if not RUN_IN_DOCKER:
                 shutil.copyfile(
                     os.path.join(testcases_dir, str(i), test_file[0]),
                     os.path.join(_execution_dir, test_file[0])
@@ -295,7 +294,6 @@ def judge(
                 return_code = int(statics["return"])
 
             else:
-                # print(command)
                 container: docker.models.containers.Container = DockerClient.containers.run(
                     image=image,
                     command=command,
@@ -339,7 +337,7 @@ def judge(
                 output = _output
 
         except RUNTIME_ERROR as e:
-            yield from save(i, declare.StatusCode.RUNTIME_ERROR.value, str(e.args[0]))
+            yield from save(i, declare.StatusCode.RUNTIME_ERROR.value, {"error": str(e.args[0])})
             continue
 
         except MEMORYLIMIT_EXCEEDED:
@@ -353,6 +351,7 @@ def judge(
         except requests.exceptions.ConnectionError as e:
             if urllib3.exceptions.ReadTimeoutError in e.args:
                 yield from save(i, declare.StatusCode.TIME_LIMIT_EXCEEDED.value, str(e))
+                container.remove()
                 continue
 
             else:

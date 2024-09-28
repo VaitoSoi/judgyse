@@ -4,7 +4,6 @@ import logging
 import os
 import typing
 import threading
-import queue
 
 import fastapi
 
@@ -82,7 +81,7 @@ class SessionManager:
                     self.logger.info("stop recv")
                     break
 
-                self.logger.debug(f"received {message}")
+                # self.logger.debug(f"received {message}")
 
                 command: str
                 data: typing.Any
@@ -162,6 +161,7 @@ class SessionManager:
 
             case "init":
                 await self.parse_session(parsed)
+                # self.logger.debug(self.session)
 
             case "code":
                 await self.write_code(parsed)
@@ -198,6 +198,7 @@ class SessionManager:
 
                         elif isinstance(position, int):
                             self.status = declare.Status(status="busy", progress=position.__str__())
+                            # self.logger.debug(data)
                             await self.send(["judge.result", declare.JudgeResult(
                                 position=position,
                                 status=status,
@@ -232,7 +233,7 @@ class SessionManager:
                         error.__str__(),
                     ])
 
-                except exception.UNKNOWN_ERROR as error:
+                except (exception.UNKNOWN_ERROR, Exception) as error:
                     # raise error from error
                     self.logger.error("unknown error, detail")
                     self.logger.exception(error)
@@ -398,6 +399,7 @@ class SessionManager:
         # compressed = data[1]
         # if compressed:
         #     file_content = zlib.decompress(file_content)
+        self.logger.debug(file_content)
         utils.write(os.path.join(judge.execution_dir, file_name), file_content)
 
         await self.send(["judge.write:code", {"status": 0}])
